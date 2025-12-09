@@ -1,0 +1,7 @@
+*.Rproj
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+new_reference*
+bibliographic_coupling_results*
