@@ -28,38 +28,15 @@ library(readr)
 # ----------------------------------------------------------
 
 # Deine Seed-Papers: DOIs und/oder PMIDs (gemischt möglich)
-seed_ids_raw <- c(
-  # Beispiele:
-  "17355824", 
-  "27137154", 
-  "28507879", 
-  "10413120", 
-  "34400738", 
-  "20936307", 
-  "25909272", 
-  "10419364", 
-  "25344641", 
-  "29279998", 
-  "28182597", 
-  "29547951", 
-  "31332570", 
-  "12431286", 
-  "8169645", 
-  "21892390", 
-  "30637172", 
-  "27886874", 
-  "28658125", 
-  "27706424", 
-  "35763222", 
-  "17109175", 
-  "29951274", 
-  "21559107", 
-  "28808751", 
-  "10382247", 
-  "10616053", 
-  "8553116"         # Beispiel-PMID
-  # Weitere IDs hier ergänzen ...
-)
+seed_file <- "seed_ids.txt"
+
+seed_ids_raw <- readr::read_lines(seed_file) %>%
+  trimws() %>%                     # Leerzeichen entfernen
+  .[nzchar(.)] %>%                 # leere Zeilen entfernen
+  unique()                         # ggf. doppelte entfernen
+
+
+# seed_ids_raw <- read.delim("new_reference_pmids.txt", header = FALSE, sep = ",")
 
 # Mindestanzahl Seed-Papers, die eine Referenz teilen
 min_shared_refs   <- 2   # für Bibliographic Coupling
@@ -702,25 +679,3 @@ if (length(all_results) == 0) {
 }
 
 message("Fertig.")
-
-# 
-# A) Kompakte Version
-# 
-# Zusätzlich zur klassischen Datenbanksuche wurde eine zitationsbasierte Recherche durchgeführt. Ausgehend von einer vorab definierten Menge relevanter Schlüsselpublikationen („Seed-Papers“) wurden mittels der OpenAlex-Programmierschnittstelle (API) deren Referenzen sowie zitierende Arbeiten abgerufen. Auf dieser Basis wurden (1) Bibliographic Coupling (Arbeiten, die von mehreren Seed-Papers gemeinsam zitiert werden) und (2) Co-Citation (Arbeiten, die mehrere Seed-Papers zitieren) berechnet.
-# Aus den resultierenden Netzwerken wurden jene Arbeiten extrahiert, die mit mindestens k Seed-Papers verknüpft waren (k = X für Bibliographic Coupling, k = Y für Co-Citation). Die identifizierten Publikationen wurden dedupliziert, von den Seed-Papers abgezogen und in bibliographischen Formaten (RIS/BibTeX) exportiert, um sie in das Screening-Tool (Rayyan/Covidence/…) zu importieren und gemäß den vordefinierten Ein- und Ausschlusskriterien zu bewerten.
-# 
-# („X/Y“ kannst du durch deine Schwellen ersetzen, z.B. 2 oder 3.)
-# 
-# B) Ausführlichere Version (inkl. etwas mehr Technik)
-# 
-# Zitationsbasierte Erweiterung der Literaturrecherche
-# 
-# Zusätzlich zur systematischen Suche in bibliographischen Datenbanken (MEDLINE, Embase, …) wurde eine zitationsbasierte Suche durchgeführt, um thematisch eng verknüpfte Arbeiten zu identifizieren. Hierfür wurde zunächst eine Menge relevanter Schlüsselpublikationen („Seed-Papers“) definiert, die entweder über DOI oder PubMed-ID vorlagen. Diese Identifikatoren wurden über die OpenAlex-API einheitlich auf OpenAlex-Work-IDs abgebildet.
-# 
-# Für jedes Seed-Paper wurden anschließend (a) alle referenzierten Arbeiten und (b) alle zitierenden Arbeiten aus OpenAlex abgerufen. Auf dieser Grundlage wurden zwei zitationsbasierte Maße berechnet:
-#   
-#   Bibliographic Coupling: Für jede referenzierte Arbeit wurde bestimmt, von wie vielen Seed-Papers sie zitiert wird. Arbeiten, die von mindestens k Seed-Papers gemeinsam referenziert wurden (k = X), wurden als potenziell relevante thematische Knoten identifiziert.
-# 
-# Co-Citation: Für jede zitierende Arbeit wurde bestimmt, wie viele Seed-Papers sie zitiert. Arbeiten, die mindestens k Seed-Papers zitierten (k = Y), wurden als Co-Citation-Knoten betrachtet.
-# 
-# Die sich aus beiden Verfahren ergebenden Treffer wurden zusammengeführt, dedupliziert und um bibliographische Metadaten (Titel, Jahr, Zeitschrift, DOI, PubMed-ID) angereichert. Anschließend wurden die Seed-Papers entfernt, und die verbleibenden Arbeiten wurden in RIS- und BibTeX-Format exportiert und in das Screening-Tool (Rayyan/Covidence/EPPI-Reviewer) eingespielt. Das Screening erfolgte zweistufig (Titel/Abstract, anschließend Volltext) gemäß den im Protokoll definierten Einschluss- und Ausschlusskriterien.
