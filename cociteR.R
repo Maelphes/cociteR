@@ -27,16 +27,26 @@ library(readr)
 # 1. PARAMETER: HIER ANPASSEN
 # ----------------------------------------------------------
 
-# Deine Seed-Papers: DOIs und/oder PMIDs (gemischt möglich)
+###########################################################
+# Seed-IDs aus Textdatei einlesen
+###########################################################
+
+# Pfad zur Eingabedatei (eine ID pro Zeile, DOIs und/oder PMIDs))
 seed_file <- "seed_ids.txt"
 
+# IDs lesen
 seed_ids_raw <- readr::read_lines(seed_file) %>%
   trimws() %>%                     # Leerzeichen entfernen
   .[nzchar(.)] %>%                 # leere Zeilen entfernen
   unique()                         # ggf. doppelte entfernen
 
 
-# seed_ids_raw <- read.delim("new_reference_pmids.txt", header = FALSE, sep = ",")
+if (length(seed_ids_raw) == 0) {
+  stop("Die Datei 'seed_ids.txt' enthält keine Seed-IDs.")
+}
+
+message("Gelesene Seed-IDs: ", length(seed_ids_raw))
+print(seed_ids_raw)
 
 # Mindestanzahl Seed-Papers, die eine Referenz teilen
 min_shared_refs   <- 2   # für Bibliographic Coupling
