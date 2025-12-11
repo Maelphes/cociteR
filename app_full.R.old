@@ -1,0 +1,540 @@
+############################################################
+# Shiny-App: Co-Citation & Bibliographic Coupling mit OpenAlex
+############################################################
+
+library(shiny)
+library(httr)
+library(jsonlite)
+library(dplyr)
+library(purrr)
+library(tibble)
+library(stringr)
+library(readr)
+
+############################################################
+# Globale Einstellungen / Hilfsfunktionen
+############################################################
+
+openalex_base <- "https://api.openalex.org/works"
+contact_email <- NULL  # wird später aus dem UI gesetzt
+
+`%||%` <- function(a, b) if (!is.null(a)) a else b
+
+clean_id <- function(x) {
+  x <- trimws(x)
+  x <- gsub("(?i)^pmid:\\s*", "", x, perl = TRUE)  # "PMID:" entfernen
+  x <- gsub("(?i)^doi:\\s*",  "", x, perl = TRUE)  # "DOI:" entfernen
+  x
+}
+
+detect_id_type <- function(id) {
+  id_clean <- clean_id(id)
+  
+  if (grepl("^[0-9]+$", id_clean)) {
+    return("pmid")
+  }
+  if (grepl("(?i)^doi:", id)) {
+    return("doi")
+  }
+  if (grepl("^10\\.[0-9]{4,9}/", id_clean)) {
+    return("doi")
+  }
+  if (grepl("^10\\.", id_clean) && !grepl("/", id_clean)) {
+    return("pmid")
+  }
+  if (grepl("/", id_clean)) {
+    return("doi")
+  }
+  return("pmid")
+}
+
+id_to_openalex_id <- function(id) {
+  id_clean <- clean_id(id)
+  id_type  <- detect_id_type(id)
+  
+  if (id_type == "doi") {
+    url <- paste0(openalex_base, "/doi:", id_clean)
+  } else {
+    url <- paste0(openalex_base, "/pmid:", id_clean)
+  }
+  
+  query <- list()
+  if (!is.null(contact_email) && nzchar(contact_email)) {
+    query$mailto <- contact_email
+  }
+  
+  message("Löse ID auf (", id_type, "): ", id_clean, "  -->  ", url)
+  
+  resp <- httr::GET(url, query = query)
+  status <- httr::status_code(resp)
+  
+  if (status == 404) {
+    warning("Nicht gefunden in OpenAlex (404): ", id_clean,
+            " (interpretiert als ", id_type, ")")
+    return(NA_character_)
+  }
+  
+  httr::stop_for_status(resp)
+  
+  res <- httr::content(resp, as = "text", encoding = "UTF-8") |>
+    jsonlite::fromJSON()
+  Sys.sleep(0.2)
+  res$id
+}
+
+get_work <- function(openalex_id) {
+  id_clean <- openalex_id
+  
+  if (str_starts(id_clean, "http")) {
+    id_clean <- sub(".*/", "", id_clean)
+  }
+  
+  url <- paste0(openalex_base, "/", id_clean)
+  
+  query <- list()
+  if (!is.null(contact_email) && nzchar(contact_email)) {
+    query$mailto <- contact_email
+  }
+  
+  resp <- httr::GET(url, query = query)
+  status <- httr::status_code(resp)
+  
+  if (status == 404) {
+    message("OpenAlex-Work nicht gefunden (404), wird übersprungen: ", id_clean)
+    return(NULL)
+  }
+  
+  if (status != 200) {
+    txt <- httr::content(resp, as = "text", encoding = "UTF-8")
+    warning("OpenAlex-Antwort ist kein 200 OK (Status ", status, ").\n",
+            "URL: ", url, "\n",
+            "Antwort (Anfang): ", substr(txt, 1, 200))
+    return(NULL)
+  }
+  
+  ctype <- httr::http_type(resp)
+  if (!grepl("json", ctype, ignore.case = TRUE)) {
+    txt <- httr::content(resp, as = "text", encoding = "UTF-8")
+    warning("OpenAlex hat keinen JSON-Content geliefert (Content-Type: ", ctype, ").\n",
+            "URL: ", url, "\n",
+            "Antwort (Anfang): ", substr(txt, 1, 200))
+    return(NULL)
+  }
+  
+  txt <- httr::content(resp, as = "text", encoding = "UTF-8")
+  
+  res <- tryCatch(
+    jsonlite::fromJSON(txt),
+    error = function(e) {
+      warning("JSON-Parsing-Fehler bei URL: ", url, "\n",
+              "Fehler: ", conditionMessage(e), "\n",
+              "Antwort (Anfang): ", substr(txt, 1, 200))
+      return(NULL)
+    }
+  )
+  
+  Sys.sleep(0.2)
+  res
+}
+
+get_referenced_works <- function(openalex_id) {
+  w <- get_work(openalex_id)
+  if (is.null(w)) return(character(0))
+  refs <- w$referenced_works
+  if (is.null(refs)) character(0) else unlist(refs)
+}
+
+get_citing_works <- function(openalex_id, max_works = 1000) {
+  w <- get_work(openalex_id)
+  if (is.null(w)) return(character(0))
+  
+  url <- w$cited_by_api_url
+  if (is.null(url) || !nzchar(url)) {
+    return(character(0))
+  }
+  
+  per_page <- 200
+  collected <- character(0)
+  cursor <- "*"
+  
+  query_base <- list(`per-page` = per_page)
+  if (!is.null(contact_email) && nzchar(contact_email)) {
+    query_base$mailto <- contact_email
+  }
+  
+  repeat {
+    query <- c(query_base, list(cursor = cursor))
+    resp <- httr::GET(url, query = query)
+    status <- httr::status_code(resp)
+    if (status == 404) {
+      message("cited_by-List nicht gefunden (404) für: ", openalex_id)
+      break
+    }
+    httr::stop_for_status(resp)
+    
+    data <- httr::content(resp, as = "text", encoding = "UTF-8") |>
+      jsonlite::fromJSON()
+    Sys.sleep(0.2)
+    
+    res <- data$results
+    if (length(res) == 0) break
+    
+    ids <- vapply(res, function(r) r$id, character(1))
+    collected <- c(collected, ids)
+    
+    if (length(collected) >= max_works) {
+      message("Erreichtes Limit max_works = ", max_works,
+              " für Seed: ", openalex_id)
+      break
+    }
+    
+    cursor <- data$meta$`next_cursor`
+    if (is.null(cursor) || !nzchar(cursor)) break
+  }
+  
+  unique(collected)
+}
+
+get_basic_metadata <- function(openalex_ids) {
+  openalex_ids <- unique(openalex_ids)
+  openalex_ids <- openalex_ids[!is.na(openalex_ids) & nzchar(openalex_ids)]
+  message("Hole Metadaten für ", length(openalex_ids), " Arbeiten ...")
+  
+  map_df(openalex_ids, function(oid) {
+    w <- get_work(oid)
+    
+    if (is.null(w) || length(w) == 0) {
+      return(tibble(
+        openalex_id      = oid,
+        title            = NA_character_,
+        publication_year = NA_integer_,
+        doi              = NA_character_,
+        pmid             = NA_character_,
+        journal          = NA_character_,
+        volume           = NA_character_,
+        issue            = NA_character_,
+        first_page       = NA_character_,
+        last_page        = NA_character_,
+        pages            = NA_character_,
+        authors          = NA_character_
+      ))
+    }
+    
+    pmid   <- w$ids$pmid %||% NA_character_
+    doi    <- w$doi %||% NA_character_
+    title  <- w$title %||% NA_character_
+    year   <- w$publication_year %||% NA_integer_
+    
+    journal <- w$host_venue$display_name %||% NA_character_
+    
+    volume <- w$biblio$volume %||% NA_character_
+    issue  <- w$biblio$issue %||% NA_character_
+    fp     <- w$biblio$first_page %||% NA_character_
+    lp     <- w$biblio$last_page %||% NA_character_
+    
+    authors_vec <- character(0)
+    auths <- w$authorships
+    
+    if (!is.null(auths) && length(auths) > 0) {
+      if (is.data.frame(auths)) {
+        if ("author.display_name" %in% names(auths)) {
+          authors_vec <- auths$author.display_name
+        } else if ("author" %in% names(auths) && is.list(auths$author)) {
+          authors_vec <- vapply(
+            auths$author,
+            function(a) {
+              if (is.list(a) && !is.null(a$display_name) &&
+                  !is.na(a$display_name)) {
+                as.character(a$display_name)
+              } else {
+                NA_character_
+              }
+            },
+            character(1)
+          )
+        }
+      } else if (is.list(auths)) {
+        authors_vec <- vapply(
+          auths,
+          function(a) {
+            if (is.list(a) && !is.null(a$author) && is.list(a$author) &&
+                !is.null(a$author$display_name) &&
+                !is.na(a$author$display_name)) {
+              as.character(a$author$display_name)
+            } else if (is.list(a) && !is.null(a$author_display_name)) {
+              as.character(a$author_display_name)
+            } else {
+              NA_character_
+            }
+          },
+          character(1)
+        )
+      }
+    }
+    
+    if (length(authors_vec) > 0) {
+      authors_vec <- authors_vec[!is.na(authors_vec) & authors_vec != ""]
+    }
+    
+    authors_str <- if (length(authors_vec) > 0) {
+      paste(authors_vec, collapse = "; ")
+    } else {
+      NA_character_
+    }
+    
+    pages <- if (!is.null(fp) && nzchar(fp) && !is.null(lp) && nzchar(lp)) {
+      paste0(fp, "-", lp)
+    } else {
+      fp %||% NA_character_
+    }
+    
+    tibble(
+      openalex_id      = oid,
+      title            = title,
+      publication_year = year,
+      doi              = doi,
+      pmid             = pmid,
+      journal          = journal,
+      volume           = volume,
+      issue            = issue,
+      first_page       = fp,
+      last_page        = lp,
+      pages            = pages,
+      authors          = authors_str
+    )
+  })
+}
+
+############################################################
+# UI
+############################################################
+
+ui <- fluidPage(
+  titlePanel("Co-Citation & Bibliographic Coupling (OpenAlex)"),
+  sidebarLayout(
+    sidebarPanel(
+      fileInput(
+        "seed_file",
+        "Seed-Datei (Text, eine DOI oder PMID pro Zeile)",
+        accept = c(".txt")
+      ),
+      numericInput(
+        "min_shared_refs",
+        "Min. Anzahl Seed-Papers pro Referenz (Bibliographic Coupling)",
+        value = 2, min = 1, step = 1
+      ),
+      numericInput(
+        "min_shared_citers",
+        "Min. Anzahl Seed-Papers pro zitierende Arbeit (Co-Citation)",
+        value = 2, min = 1, step = 1
+      ),
+      numericInput(
+        "max_citing",
+        "Max. Anzahl zitierender Arbeiten pro Seed",
+        value = 500, min = 50, step = 50
+      ),
+      textInput(
+        "contact_email",
+        "Kontakt-E-Mail für OpenAlex (optional)",
+        value = ""
+      ),
+      actionButton("run_btn", "Analyse starten")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel(
+          "Bibliographic Coupling",
+          h4("Gemeinsam referenzierte Arbeiten"),
+          tableOutput("bc_table")
+        ),
+        tabPanel(
+          "Co-Citation",
+          h4("Arbeiten, die mehrere Seed-Papers zitieren"),
+          tableOutput("cc_table")
+        )
+      )
+    )
+  )
+)
+
+############################################################
+# SERVER
+############################################################
+
+server <- function(input, output, session) {
+  
+  results <- eventReactive(input$run_btn, {
+    req(input$seed_file)
+    
+    # globale Variable für API-Helper setzen
+    contact_email <<- input$contact_email
+    
+    seed_ids_raw <- readr::read_lines(input$seed_file$datapath) |>
+      trimws() |>
+      .[nzchar(.)] |>
+      unique()
+    
+    validate(
+      need(length(seed_ids_raw) > 0,
+           "Die Seed-Datei enthält keine IDs.")
+    )
+    
+    # Seed-IDs -> OpenAlex-IDs
+    seed_ids_clean <- unique(clean_id(seed_ids_raw))
+    seed_oa_ids <- map_chr(seed_ids_clean, id_to_openalex_id)
+    names(seed_oa_ids) <- seed_ids_clean
+    seed_oa_ids <- seed_oa_ids[!is.na(seed_oa_ids)]
+    
+    validate(
+      need(length(seed_oa_ids) > 0,
+           "Keine der Seed-IDs konnte in OpenAlex aufgelöst werden.")
+    )
+    
+    message("Erfolgreich aufgelöste Seeds: ", length(seed_oa_ids))
+    
+    # ---------------- Bibliographic Coupling ----------------
+    refs_list <- map(seed_oa_ids, get_referenced_works)
+    names(refs_list) <- seed_oa_ids
+    
+    refs_long <- imap_dfr(
+      refs_list,
+      ~ tibble(
+        seed_openalex_id = .y,
+        ref_openalex_id  = .x
+      )
+    )
+    
+    bc_df <- refs_long %>%
+      distinct(seed_openalex_id, ref_openalex_id) %>%
+      count(ref_openalex_id, name = "n_seed_papers_citing") %>%
+      filter(n_seed_papers_citing >= input$min_shared_refs) %>%
+      arrange(desc(n_seed_papers_citing))
+    
+    if (nrow(bc_df) > 0) {
+      seed_by_ref <- refs_long %>%
+        distinct(seed_openalex_id, ref_openalex_id) %>%
+        group_by(ref_openalex_id) %>%
+        summarise(
+          seed_openalex_ids = paste(unique(seed_openalex_id), collapse = ";"),
+          .groups = "drop"
+        )
+      
+      bc_df <- bc_df %>%
+        left_join(seed_by_ref, by = "ref_openalex_id")
+      
+      meta_bc <- get_basic_metadata(bc_df$ref_openalex_id)
+      
+      bc_result <- bc_df %>%
+        rename(openalex_id = ref_openalex_id) %>%
+        left_join(meta_bc, by = "openalex_id") %>%
+        arrange(desc(n_seed_papers_citing), publication_year)
+    } else {
+      bc_result <- tibble(
+        Hinweis = "Keine gemeinsamen Referenzen mit der gewählten Schwelle gefunden."
+      )
+    }
+    
+    # ---------------- Co-Citation ----------------
+    citers_list <- map(
+      seed_oa_ids,
+      ~ get_citing_works(.x, max_works = input$max_citing)
+    )
+    names(citers_list) <- seed_oa_ids
+    
+    citers_long <- imap_dfr(
+      citers_list,
+      ~ tibble(
+        seed_openalex_id  = .y,
+        citer_openalex_id = .x
+      )
+    )
+    
+    cc_df <- citers_long %>%
+      distinct(seed_openalex_id, citer_openalex_id) %>%
+      count(citer_openalex_id, name = "n_seed_papers_cited") %>%
+      filter(n_seed_papers_cited >= input$min_shared_citers) %>%
+      arrange(desc(n_seed_papers_cited))
+    
+    if (nrow(cc_df) > 0) {
+      seeds_per_citer <- citers_long %>%
+        distinct(seed_openalex_id, citer_openalex_id) %>%
+        group_by(citer_openalex_id) %>%
+        summarise(
+          seed_openalex_ids = paste(unique(seed_openalex_id), collapse = ";"),
+          .groups = "drop"
+        )
+      
+      cc_df <- cc_df %>%
+        left_join(seeds_per_citer, by = "citer_openalex_id")
+      
+      meta_cc <- get_basic_metadata(cc_df$citer_openalex_id)
+      
+      cc_result <- cc_df %>%
+        rename(openalex_id = citer_openalex_id) %>%
+        left_join(meta_cc, by = "openalex_id") %>%
+        arrange(desc(n_seed_papers_cited), publication_year)
+    } else {
+      cc_result <- tibble(
+        Hinweis = "Keine Co-Citation-Knoten mit der gewählten Schwelle gefunden."
+      )
+    }
+    
+    list(
+      bc = bc_result,
+      cc = cc_result
+    )
+  })
+  
+  output$bc_table <- renderTable({
+    res <- results()
+    req(res$bc)
+    # ggf. auf die wichtigsten Spalten reduzieren
+    if ("Hinweis" %in% names(res$bc)) {
+      res$bc
+    } else {
+      head(
+        res$bc %>%
+          select(
+            n_seed_papers_citing,
+            title,
+            publication_year,
+            journal,
+            doi,
+            pmid,
+            openalex_id,
+            seed_openalex_ids
+          ),
+        100
+      )
+    }
+  })
+  
+  output$cc_table <- renderTable({
+    res <- results()
+    req(res$cc)
+    if ("Hinweis" %in% names(res$cc)) {
+      res$cc
+    } else {
+      head(
+        res$cc %>%
+          select(
+            n_seed_papers_cited,
+            title,
+            publication_year,
+            journal,
+            doi,
+            pmid,
+            openalex_id,
+            seed_openalex_ids
+          ),
+        100
+      )
+    }
+  })
+}
+
+############################################################
+# App starten
+############################################################
+
+shinyApp(ui, server)
