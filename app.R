@@ -11,6 +11,11 @@ library(tibble)
 library(stringr)
 library(readr)
 
+# --- einfache In-Memory-Caches (pro App-Session/Start) ---
+.work_cache   <- new.env(parent = emptyenv())  # cache für get_work()
+.citers_cache <- new.env(parent = emptyenv())  # cache für get_citing_works()
+.refs_cache   <- new.env(parent = emptyenv())  # cache für get_referenced_works()
+
 openalex_base <- "https://api.openalex.org/works"
 contact_email <- NULL
 
@@ -105,7 +110,7 @@ id_to_openalex_id <- function(id) {
   if (!is.character(txt)) txt <- as.character(txt)
   
   res <- jsonlite::fromJSON(txt)
-  Sys.sleep(0.2)
+  Sys.sleep(0.05)
   res$id
 }
 
@@ -115,6 +120,11 @@ get_work <- function(openalex_id) {
   
   if (str_starts(id_clean, "http")) {
     id_clean <- sub(".*/", "", id_clean)
+  }
+
+  # ---- CACHE: wenn wir diese Work schon geladen haben, sofort zurückgeben
+  if (exists(id_clean, envir = .work_cache, inherits = FALSE)) {
+    return(get(id_clean, envir = .work_cache, inherits = FALSE))
   }
   
   url <- paste0(openalex_base, "/", id_clean)
@@ -129,6 +139,7 @@ get_work <- function(openalex_id) {
   
   if (status == 404) {
     message("OpenAlex-Work nicht gefunden (404), wird übersprungen: ", id_clean)
+    assign(id_clean, NULL, envir = .work_cache)
     return(NULL)
   }
   
@@ -137,6 +148,7 @@ get_work <- function(openalex_id) {
     warning("OpenAlex-Antwort ist kein 200 OK (Status ", status, ").\n",
             "URL: ", url, "\n",
             "Antwort (Anfang): ", substr(txt_raw, 1, 200))
+    assign(id_clean, NULL, envir = .work_cache)
     return(NULL)
   }
   
@@ -146,6 +158,7 @@ get_work <- function(openalex_id) {
     warning("OpenAlex hat keinen JSON-Content geliefert (Content-Type: ", ctype, ").\n",
             "URL: ", url, "\n",
             "Antwort (Anfang): ", substr(txt_raw, 1, 200))
+    assign(id_clean, NULL, envir = .work_cache)
     return(NULL)
   }
   
@@ -164,52 +177,119 @@ get_work <- function(openalex_id) {
     }
   )
   
-  Sys.sleep(0.2)
+  Sys.sleep(0.05)
+  
+  # ---- CACHE SAVE (auch NULL kann gespeichert werden, falls du willst)
+  assign(id_clean, res, envir = .work_cache)
+  
   res
 }
 
 
 get_referenced_works <- function(openalex_id) {
+  wid <- openalex_id
+  if (stringr::str_starts(wid, "http")) wid <- sub(".*/", "", wid)
+  
+  if (exists(wid, envir = .refs_cache, inherits = FALSE)) {
+    return(get(wid, envir = .refs_cache, inherits = FALSE))
+  }
+  
   w <- get_work(openalex_id)
-  if (is.null(w)) return(character(0))
+  if (is.null(w)) {
+    assign(wid, character(0), envir = .refs_cache)
+    return(character(0))
+  }
+  
   refs <- w$referenced_works
-  if (is.null(refs)) character(0) else unlist(refs)
+  out <- if (is.null(refs)) character(0) else unique(unlist(refs))
+  
+  assign(wid, out, envir = .refs_cache)
+  out
 }
+
 
 get_citing_works <- function(openalex_id, max_works = 1000) {
   w <- get_work(openalex_id)
   if (is.null(w)) return(character(0))
+  
+  # OpenAlex Work-ID (Wxxxx) extrahieren
+  wid <- openalex_id
+  if (stringr::str_starts(wid, "http")) wid <- sub(".*/", "", wid)
+  
+  # ---- CACHE: pro Seed + max_works cachen
+  cache_key <- paste0(wid, "|", max_works)
+  if (exists(cache_key, envir = .citers_cache, inherits = FALSE)) {
+    return(get(cache_key, envir = .citers_cache, inherits = FALSE))
+  }
+  
+  # 1) Primär: cited_by_api_url, falls vorhanden
   url <- w$cited_by_api_url
-  if (is.null(url) || !nzchar(url)) return(character(0))
+  
+  # 2) Fallback: works?filter=cites:Wxxxx
+  if (is.null(url) || !nzchar(url)) {
+    url <- paste0(openalex_base, "?filter=cites:", wid)
+  }
+  
   per_page <- 200
   collected <- character(0)
   cursor <- "*"
+  
   query_base <- list(`per-page` = per_page)
   if (!is.null(contact_email) && nzchar(contact_email)) {
     query_base$mailto <- contact_email
   }
+  
   repeat {
     query <- c(query_base, list(cursor = cursor))
     resp <- httr::GET(url, query = query)
     status <- httr::status_code(resp)
     if (status == 404) break
     httr::stop_for_status(resp)
+    
     txt <- httr::content(resp, as = "text", encoding = "UTF-8")
-    if (!is.character(txt)) {
-      txt <- as.character(txt)
-    }
-    data <- jsonlite::fromJSON(txt)
-    Sys.sleep(0.2)
+    if (!is.character(txt)) txt <- as.character(txt)
+    
+    data <- jsonlite::fromJSON(txt)  # results kann data.frame ODER list sein
+    Sys.sleep(0.05)
+    
     res <- data$results
-    if (length(res) == 0) break
-    ids <- vapply(res, function(r) r$id, character(1))
+    if (is.null(res) || length(res) == 0) break
+    
+    ids <- character(0)
+    
+    # Fall 1: results ist data.frame
+    if (is.data.frame(res)) {
+      if ("id" %in% names(res)) {
+        ids <- as.character(res$id)
+      } else {
+        ids <- character(0)
+      }
+    } else if (is.list(res)) {
+      # Fall 2: results ist Liste von Records
+      ids <- vapply(res, function(r) {
+        if (is.list(r) && !is.null(r$id)) as.character(r$id) else NA_character_
+      }, character(1))
+      ids <- ids[!is.na(ids)]
+    } else {
+      # Fall 3: irgendwas Degeneriertes -> abbrechen
+      break
+    }
+    
+    if (length(ids) == 0) break
+    
     collected <- c(collected, ids)
+    
     if (length(collected) >= max_works) break
+    
     cursor <- data$meta$`next_cursor`
     if (is.null(cursor) || !nzchar(cursor)) break
   }
-  unique(collected)
+  
+  out <- unique(collected)
+  assign(cache_key, out, envir = .citers_cache)
+  out
 }
+
 
 get_basic_metadata <- function(openalex_ids) {
   openalex_ids <- unique(openalex_ids)
@@ -345,9 +425,13 @@ ui <- fluidPage(
       fileInput("seed_file", "Seed-Datei (eine DOI oder PMID pro Zeile)", accept = ".txt"),
       numericInput("min_shared_refs", "Min. Seed-Papers pro Referenz (BC)", value = 2, min = 1, step = 1),
       numericInput("min_shared_citers", "Min. Seed-Papers pro zitierende Arbeit (CC)", value = 2, min = 1, step = 1),
-      numericInput("max_citing", "Max. zitierende Arbeiten pro Seed", value = 500, min = 50, step = 50),
+      numericInput("max_citing", "Max. zitierende Arbeiten pro Seed", value = 200, min = 50, step = 50),
       textInput("contact_email", "Kontakt-E-Mail für OpenAlex (optional)", value = ""),
-      actionButton("run_btn", "Analyse starten")
+      actionButton("run_btn", "Analyse starten"),
+      actionButton("clear_cache", "Cache leeren")#,
+      # hr(),
+      # h4("Log"),
+      # verbatimTextOutput("log", placeholder = TRUE)
     ),
     mainPanel(
       tabsetPanel(
@@ -381,11 +465,30 @@ ui <- fluidPage(
 )
 
 server <- function(input, output, session) {
+
+  # # --- Log-Speicher ---
+  # log_txt <- reactiveVal("")
+  # 
+  # # --- Log-Helferfunktion ---
+  # append_log <- function(...) {
+  #   msg <- paste0(..., collapse = "")
+  #   log_txt(
+  #     paste(
+  #       log_txt(),
+  #       paste0(format(Sys.time(), "%H:%M:%S"), "  ", msg),
+  #       sep = "\n"
+  #     )
+  #   )
+  # }
+  
+  output$log <- renderText({
+    log_txt()
+  })
   
   results <- eventReactive(input$run_btn, {
     req(input$seed_file)
     contact_email <<- input$contact_email
-    
+
     # IDs einlesen (ohne Pipe-Fallstrick)
     seed_ids_raw <- readr::read_lines(input$seed_file$datapath)
     seed_ids_raw <- trimws(seed_ids_raw)
@@ -419,6 +522,31 @@ server <- function(input, output, session) {
     }
     
     seed_oa_ids_valid <- seeds_valid$openalex_id
+    
+    # # --- DEBUG: CC-Pipeline prüfen ---
+    # seed_cc_debug <- tibble(
+    #   seed_openalex_id = seed_oa_ids_valid
+    # ) %>%
+    #   mutate(
+    #     cited_by_count = purrr::map_int(seed_openalex_id, ~ {
+    #       w <- get_work(.x)
+    #       if (is.null(w)) return(NA_integer_)
+    #       w$cited_by_count %||% NA_integer_
+    #     }),
+    #     cited_by_api_url = purrr::map_chr(seed_openalex_id, ~ {
+    #       w <- get_work(.x)
+    #       if (is.null(w) || is.null(w$cited_by_api_url)) return(NA_character_)
+    #       w$cited_by_api_url
+    #     })
+    #   )
+    # 
+    # print(seed_cc_debug)
+    # 
+    # # Für jeden Seed: wie viele Zitierer holen wir wirklich?
+    # citer_counts <- purrr::map_int(seed_oa_ids_valid, ~ length(get_citing_works(.x, max_works = input$max_citing)))
+    # print(tibble(seed_openalex_id = seed_oa_ids_valid, n_citers_returned = citer_counts))
+    # # --- Ende DEBUG ---
+
     
     # Metadaten für Seeds holen und an seeds_tbl anhängen
     meta_seeds <- get_basic_metadata(seed_oa_ids_valid)
@@ -459,7 +587,9 @@ server <- function(input, output, session) {
     }
     
     # --- Co-Citation ---
-    citers_list <- map(seed_oa_ids_valid, ~ get_citing_works(.x, max_works = input$max_citing))
+    max_citing_eff <- if (input$min_shared_citers >= 2) min(input$max_citing, 200) else input$max_citing
+    citers_list <- map(seed_oa_ids_valid, ~ get_citing_works(.x, max_works = max_citing_eff))
+#   citers_list <- map(seed_oa_ids_valid, ~ get_citing_works(.x, max_works = input$max_citing))
     names(citers_list) <- seed_oa_ids_valid
     
     citers_long <- imap_dfr(
@@ -492,6 +622,13 @@ server <- function(input, output, session) {
     )
   })
 
+  # --- Notwendig für Cache-Reset-Button --- 
+  
+  observeEvent(input$clear_cache, {
+    rm(list = ls(.work_cache),   envir = .work_cache)
+    rm(list = ls(.refs_cache),   envir = .refs_cache)
+    rm(list = ls(.citers_cache), envir = .citers_cache)
+  })
   
   # --- Downloads für BC ---
   
